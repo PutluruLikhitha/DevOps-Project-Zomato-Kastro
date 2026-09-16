@@ -1,108 +1,108 @@
 pipeline {
     agent any
-    tools {
-        jdk 'jdk17'
-        nodejs 'node23'
-    }
+
     environment {
-        SCANNER_HOME=tool 'sonar-scanner'
+        IMAGE_NAME   = "yaswanth032/zomato"
+        CLUSTER_NAME = "task8-zomato-eks"
+        AWS_REGION   = "ap-south-1"
     }
+
     stages {
-        stage ("clean workspace") {
+
+        stage('Delete Existing EKS') {
             steps {
-                cleanWs()
+                sh '''
+                    if aws eks describe-cluster \
+                        --name "$CLUSTER_NAME" \
+                        --region "$AWS_REGION" >/dev/null 2>&1; then
+
+                        echo "Existing EKS cluster found. Deleting..."
+                        eksctl delete cluster \
+                            --name "$CLUSTER_NAME" \
+                            --region "$AWS_REGION" \
+                            --wait
+                    else
+                        echo "No existing EKS cluster found."
+                    fi
+                '''
             }
         }
-        stage ("Git Checkout") {
+
+        stage('Create EKS') {
             steps {
-                git 'https://github.com/KastroVKiran/Zomato-Project-Kastro.git'
+                sh '''
+                    eksctl create cluster \
+                        --name "$CLUSTER_NAME" \
+                        --region "$AWS_REGION" \
+                        --version 1.33 \
+                        --nodegroup-name task8-ng \
+                        --node-type t3.small \
+                        --nodes 2 \
+                        --nodes-min 2 \
+                        --nodes-max 2 \
+                        --vpc-public-subnets subnet-0aafd115bc162983d,subnet-0f89a0e6a02631cdf,subnet-0b081c5fb2d76d65c
+                '''
             }
         }
-        stage("Sonarqube Analysis"){
-            steps{
-                withSonarQubeEnv('sonar-server') {
-                    sh ''' $SCANNER_HOME/bin/sonar-scanner -Dsonar.projectName=zomato \
-                    -Dsonar.projectKey=zomato '''
+
+        stage('Git Checkout') {
+            steps {
+                git branch: 'master',
+                    url: 'https://github.com/PutluruLikhitha/DevOps-Project-Zomato-Kastro.git'
+            }
+        }
+
+        stage('Docker Build') {
+            steps {
+                sh 'docker build -t $IMAGE_NAME:latest .'
+            }
+        }
+
+        stage('DockerHub Push') {
+            steps {
+                withDockerRegistry(credentialsId: 'docker') {
+                    sh 'docker push $IMAGE_NAME:latest'
                 }
             }
         }
-        stage("Code Quality Gate"){
-           steps {
-                script {
-                    waitForQualityGate abortPipeline: false, credentialsId: 'Sonar-token' 
-                }
-            } 
-        }
-        stage("Install NPM Dependencies") {
+
+        stage('Configure EKS') {
             steps {
-                sh "npm install"
+                sh '''
+                    aws eks update-kubeconfig \
+                        --region "$AWS_REGION" \
+                        --name "$CLUSTER_NAME"
+                '''
             }
         }
-        stage('OWASP FS SCAN') {
+
+        stage('Deploy to EKS') {
             steps {
-                dependencyCheck additionalArguments: '--scan ./ --disableYarnAudit --disableNodeAudit -n', odcInstallation: 'DP-Check'
-                dependencyCheckPublisher pattern: '**/dependency-check-report.xml'
+                sh '''
+                    kubectl apply -f Kubernetes/deployment.yaml
+                    kubectl apply -f Kubernetes/service.yaml
+                '''
+            }
+        }
+
+        stage('Verify Deployment') {
+            steps {
+                sh '''
+                    kubectl rollout status deployment/zomato --timeout=300s
+                    kubectl get pods
+                    kubectl get svc zomato
+                '''
+            }
+        }
     }
-}
-        stage ("Trivy File Scan") {
-            steps {
-                sh "trivy fs . > trivy.txt"
-            }
-        }
-        stage ("Build Docker Image") {
-            steps {
-                sh "docker build -t zomato ."
-            }
-        }
-        stage ("Tag & Push to DockerHub") {
-            steps {
-                script {
-                    withDockerRegistry(credentialsId: 'docker') {
-                        sh "docker tag zomato kastrov/zomato:latest "
-                        sh "docker push kastrov/zomato:latest "
-                    }
-                }
-            }
-        }
-        stage('Docker Scout Image') {
-            steps {
-                script{
-                   withDockerRegistry(credentialsId: 'docker', toolName: 'docker'){
-                       sh 'docker-scout quickview kastrov/zomato:latest'
-                       sh 'docker-scout cves kastrov/zomato:latest'
-                       sh 'docker-scout recommendations kastrov/zomato:latest'
-                   }
-                }
-            }
-        }
-        stage ("Deploy to Container") {
-            steps {
-                sh 'docker run -d --name zomato -p 3000:3000 kastrov/zomato:latest'
-            }
-        }
-    }
+
     post {
-    always {
-        emailext attachLog: true,
-            subject: "'${currentBuild.result}'",
-            body: """
-                <html>
-                <body>
-                    <div style="background-color: #FFA07A; padding: 10px; margin-bottom: 10px;">
-                        <p style="color: white; font-weight: bold;">Project: ${env.JOB_NAME}</p>
-                    </div>
-                    <div style="background-color: #90EE90; padding: 10px; margin-bottom: 10px;">
-                        <p style="color: white; font-weight: bold;">Build Number: ${env.BUILD_NUMBER}</p>
-                    </div>
-                    <div style="background-color: #87CEEB; padding: 10px; margin-bottom: 10px;">
-                        <p style="color: white; font-weight: bold;">URL: ${env.BUILD_URL}</p>
-                    </div>
-                </body>
-                </html>
-            """,
-            to: 'kastrokiran@gmail.com',
-            mimeType: 'text/html',
-            attachmentsPattern: 'trivy.txt'
+        success {
+            echo 'TASK-8 SUCCESS: EKS + Git + Docker + Jenkins + Kubernetes deployment completed.'
+        }
+
+        failure {
+            echo 'TASK-8 FAILED. Check the failed stage in Jenkins.'
         }
     }
 }
